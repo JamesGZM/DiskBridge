@@ -154,7 +154,9 @@ final class NativeEngine {
               !source.hasPrefix(store.root.path + "/"), !store.root.path.hasPrefix(source + "/") else { throw DBError("原数据目录不存在、已迁移或与工具目录重叠。") }
         let entries = try inventory(source, task: task), size = totals(entries), disk = try system.volume(app.s("volume_uuid"))
         guard disk.n("free") >= size.n("bytes") + 512 * 1024 * 1024 else { throw DBError("外置盘空间不足。") }
-        guard Double(app.n("capacity_gib")) * pow(1024, 3) >= Double(size.n("bytes")) * 1.2 + 256 * 1024 * 1024 else { throw DBError("镜像逻辑容量不足。") }
+        let capacityBytes = Double(app.n("capacity_gib")) * 1_073_741_824.0
+        let requiredBytes = Double(size.n("bytes")) * 1.2 + 268_435_456.0
+        guard capacityBytes >= requiredBytes else { throw DBError("镜像逻辑容量不足。") }
         let image = try image(key)
         if old.isEmpty {
             guard !exists(image) else { throw DBError("目标已有镜像，未覆盖。请重新选择目录。") }
