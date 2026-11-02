@@ -144,7 +144,7 @@ final class BridgeDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         let heading = NSMenuItem(title: "盘桥 · " + title, action: nil, keyEquivalent: ""); heading.isEnabled = false; menu.addItem(heading)
         for app in model.migratedApps {
-            let item = NSMenuItem(title: app.name + " · " + (app.mounted ? "已挂载" : "等待挂载"), action: #selector(openApp(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: app.name + " · " + (app.value.b("status_cached") ? "核对中" : app.mounted ? "已挂载" : "等待挂载"), action: #selector(openApp(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = app.id; item.image = NSWorkspace.shared.icon(forFile: app.value.s("app_path")); item.image?.size = NSSize(width: 18, height: 18); menu.addItem(item)
         }
         if let task = model.tasks.first(where: \.active) {

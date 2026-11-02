@@ -8,29 +8,52 @@ func groupKeys(_ store: NativeStore, _ id: String) -> [String] {
 }
 func groupID(_ key: String, app: Object) -> String { app.s("parent_id", key) }
 func publicTaskAction(_ action: String) -> Bool {
-    ["migrate", "rollback", "recover", "mount", "confirm", "delete_original", "delete_archived_original", "delete_retained", "prepare_launch", "estimate", "plan", "rollback_plan", "unmount"].contains(action)
+    ["migrate", "rollback", "recover", "mount", "confirm", "delete_original", "delete_archived_original", "delete_retained", "prepare_launch", "estimate", "scan_sizes", "plan", "rollback_plan", "unmount"].contains(action)
 }
 
 final class NativeService {
     let root: URL, runtime: URL, system: NativeSystem
     let writers = OperationQueue(), readers = OperationQueue()
     let stateLock = NSRecursiveLock()
+    let measurementLock = NSLock()
+    let catalogLock = NSLock()
+    var measurementsRunning = false
     var active: [String: NativeTask] = [:], plans: [String: Object] = [:]
     var cachedApplications: [Object] = [], catalogDate = Date.distantPast
+    var catalogRoots: Object = [:]
     var automaticRunning = false, suspended = Set<String>()
+    var automaticScope: Set<String>?, automaticPendingIDs = Set<String>(), automaticPendingAll = false
     let bootID: String
     init(root: URL, runtime: URL, system: NativeSystem = NativeSystem()) throws {
         self.root = root; self.runtime = runtime; self.system = system
         for folder in [runtime, runtime.appendingPathComponent("inbox"), runtime.appendingPathComponent("tasks")] { try privateDirectory(folder) }
         writers.maxConcurrentOperationCount = 1; writers.name = "DiskBridge.WriteQueue"
         readers.maxConcurrentOperationCount = 2; readers.name = "DiskBridge.ReadQueue"
+        if let cached = try? readObject(runtime.appendingPathComponent("catalog.json")), cached.n("version") == 1 {
+            cachedApplications = cached.list("apps"); catalogRoots = cached.o("roots")
+            catalogDate = Date(timeIntervalSince1970: cached.d("discovered_ns") / 1e9)
+        }
         bootID = (try? system.run("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], timeout: 5)).map { String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) } ?? String(Int(Date().timeIntervalSince1970 - ProcessInfo.processInfo.systemUptime))
     }
     func applicationList(_ task: NativeTask, force: Bool = false) throws -> [Object] {
-        let cached = stateLock.locked { cachedApplications }
-        if !force && !cached.isEmpty && Date().timeIntervalSince(catalogDate) < 120 { return cached }
-        let result = try discoverApplications(system: system, task: task)
-        stateLock.locked { cachedApplications = result; catalogDate = Date() }; return result
+        try catalogLock.locked {
+            let cached = stateLock.locked { cachedApplications }, roots = applicationRootStamps()
+            let sameRoots = NSDictionary(dictionary: roots).isEqual(to: catalogRoots)
+            if !force && !cached.isEmpty && sameRoots && Date().timeIntervalSince(catalogDate) < 900 {
+                if cached.allSatisfy({ applicationFingerprint($0.s("app_path")) == $0.s("catalog_signature") }) { return cached }
+                let updated = cached.compactMap { app -> Object? in
+                    applicationFingerprint(app.s("app_path")) == app.s("catalog_signature") ? app : applicationMetadata(app.s("app_path"))
+                }
+                try saveCatalog(updated, roots: roots, discovered: false); return updated
+            }
+            let result = try discoverApplications(system: system, task: task, cached: force ? [] : cached)
+            try saveCatalog(result, roots: roots); return result
+        }
+    }
+    func saveCatalog(_ apps: [Object], roots: Object, discovered: Bool = true) throws {
+        let date = discovered ? Date() : catalogDate
+        try writeObject(["version": 1, "updated_ns": stamp(), "discovered_ns": Int64(date.timeIntervalSince1970 * 1e9), "roots": roots, "apps": apps], to: runtime.appendingPathComponent("catalog.json"))
+        stateLock.locked { cachedApplications = apps; catalogRoots = roots; catalogDate = date }
     }
     func overview(_ task: NativeTask, includeCatalog: Bool) throws -> Object {
         let store = try NativeStore(root)
@@ -44,7 +67,9 @@ final class NativeService {
         for (id, keys) in grouped {
             let base = store.apps.o(keys.sorted()[0]), recordRows = keys.map { store.records.o($0) }
             var app = appsByBundle.removeValue(forKey: base.s("bundle_id")) ?? base
-            app["id"] = id; app["name"] = base.s("name", app.s("name")); app["app_path"] = base.s("app_path")
+            app["id"] = id; app["name"] = app.s("name", base.s("name")); app["app_path"] = base.s("app_path")
+            app["aliases"] = Array(Set((app["aliases"] as? [String] ?? []) + [base.s("name")]))
+            app["search_terms"] = Array(Set((app["search_terms"] as? [String] ?? []) + applicationSearchTerms(base.s("name"))))
             app["installed"] = exists(base.s("app_path")); app["managed"] = true
             let phases = recordRows.map { $0.s("phase", "configured") }
             let allRestored = phases.allSatisfy { $0 == "rolled_back" }
@@ -56,16 +81,18 @@ final class NativeService {
             app["auto_mount"] = keys.allSatisfy { store.apps.o($0).b("enabled") }
             app["auto_open"] = keys.allSatisfy { store.apps.o($0).b("auto_open") }
             var paths: [Object] = [], amount: Int64 = 0, backups: Int64 = 0, released: Int64 = 0, releaseKnown = true
-            var available = true, messages: [String] = []
+            var available = true, messages: [String] = [], amountKnown = true
             for key in keys.sorted() {
                 let profile = store.apps.o(key), record = store.records.o(key)
                 let originalPresent = !record.s("original").isEmpty && isDirectory(record.s("original"))
-                let bytes = sizes.o(key).n("bytes", record.o("verification").n("bytes")); amount += bytes
+                let verification = record.s("phase") == "rolled_back" ? record.o("restore_verification") : record.o("verification")
+                let knownBytes = verification["bytes"] as? NSNumber
+                let bytes = knownBytes?.int64Value ?? 0; amount += bytes; amountKnown = amountKnown && knownBytes != nil
                 if originalPresent { backups += record.o("verification").n("bytes") }
                 if record.b("original_deleted") && record["measured_freed_bytes"] == nil { releaseKnown = false }
                 released += record.n("measured_freed_bytes")
                 var row: Object = ["id": key, "source": profile.s("mount_point"), "folder": profile.s("folder"), "volume_uuid": profile.s("volume_uuid"),
-                    "bytes": bytes, "original": record.s("original"), "original_retained": originalPresent,
+                    "bytes": knownBytes as Any? ?? NSNull(), "volume_name": profile.s("volume_name", "已配置外置硬盘"), "original": record.s("original"), "original_retained": originalPresent,
                     "phase": record.s("phase", "configured"), "mounted": false]
                 do {
                     if !record.isEmpty && record.s("phase") != "rolled_back" {
@@ -78,19 +105,22 @@ final class NativeService {
                 }
                 paths.append(row)
             }
-            app["paths"] = paths; app["bytes"] = sizes.o(id).n("bytes", amount); app["backup_bytes"] = backups
+            app["paths"] = paths; app["bytes"] = amountKnown ? amount as Any : NSNull(); app["backup_bytes"] = backups
+            let measured = sizes.o(id)
+            if measured.n("version") == 2, measured.s("location") == app.s("data_location"), let bytes = measured["bytes"] as? NSNumber { app["bytes"] = bytes }
             app["released_bytes"] = releaseKnown ? released as Any : NSNull()
             app["mounted"] = !allRestored && available; app["availability"] = allRestored ? "internal" : available ? "ready" : "waiting"
             app["availability_note"] = Array(Set(messages)).sorted().joined(separator: "；")
             app["original_retained"] = paths.contains { $0.b("original_retained") }
             app["can_delete_original"] = (allActive || allRestored) && paths.contains { $0.b("original_retained") }
-            app["size_note"] = "已记录的数据大小，可按需重新统计。"
+            app["size_note"] = measured.s("note", "已记录的迁移校验数据量；后台可重新读取当前占用。")
             result.append(app)
         }
         if includeCatalog {
             for var app in appsByBundle.values {
                 app["migration_state"] = "unmigrated"; app["data_location"] = "internal"; app["managed"] = false
-                app["bytes"] = sizes.o(app.s("id"))["bytes"] ?? NSNull(); result.append(app)
+                let measured = sizes.o(app.s("id"))
+                app["bytes"] = measured.n("version") == 2 && measured.s("location") == "internal" ? measured["bytes"] ?? NSNull() : NSNull(); result.append(app)
             }
         }
         let retained = try retainedCopies(store)
@@ -154,6 +184,7 @@ final class NativeService {
         for source in sources {
             let digest = applicationKey(source).suffix(8), key = sources.count == 1 ? id : id + "__" + digest
             let folder = sources.count == 1 ? roundFolder : roundFolder + "/" + URL(fileURLWithPath: source).lastPathComponent + "-" + digest
+            try system.checkDestinationDirectory(disk.s("path"), folder: folder)
             let inventory = try inventory(source, task: task), summary = totals(inventory)
             count += summary.n("bytes"); files += summary.n("files")
             let capacity = max(Int64(128), Int64(ceil(Double(summary.n("bytes")) * 1.5 / pow(1024, 3))) + 1)
@@ -182,6 +213,10 @@ final class NativeService {
     }
     func migrateGroup(_ plan: Object, task: NativeTask) throws -> Object {
         let store = try NativeStore(root), id = plan.s("app_id")
+        for profile in plan.list("profiles") {
+            let disk = try system.volume(profile.s("volume_uuid"))
+            try system.checkDestinationDirectory(disk.s("path"), folder: profile.s("folder"))
+        }
         try archiveRestoredGroup(store, id: id)
         let engine = NativeEngine(store, system: system, task: task)
         for var profile in plan.list("profiles") { let key = profile.s("key"); profile.removeValue(forKey: "key"); try engine.configure(key, profile: profile) }
@@ -232,10 +267,20 @@ final class NativeService {
     }
     func execute(_ action: String, values: Object, task: NativeTask) throws -> Any {
         switch action {
-        case "catalog": return try overview(task, includeCatalog: true)
+        case "catalog":
+            if values.b("force") { _ = try applicationList(task, force: true) }
+            let result = try overview(task, includeCatalog: true)
+            _ = scheduleMeasurements(result.list("apps")); return result
         case "overview": return try overview(task, includeCatalog: false)
-        case "disks": return try system.volumes()
-        case "candidates": return candidatesFor(try findApplication(values.s("app_id"), task: task), system: system)
+        case "disks":
+            try task.begin("读取外置磁盘")
+            var found: [Object] = []
+            return try system.volumes { disk in found.append(disk); task.merge(["result": found]) }
+        case "request_sizes":
+            let result = try overview(task, includeCatalog: true)
+            return ["task_id": scheduleMeasurements(result.list("apps"), force: true) ?? ""]
+        case "clear_tasks": return try clearTaskHistory(values)
+        case "candidates": return system.dataCandidates(try findApplication(values.s("app_id"), task: task))
         case "plan": return try makePlan(values, task: task)
         case "migrate":
             guard let plan = stateLock.locked({ plans[values.s("plan_id")] }), stamp() - plan.n("created_ns") < 1_800_000_000_000 else { throw DBError("迁移预览已过期，请重新确认范围。") }
@@ -264,11 +309,11 @@ final class NativeService {
                 for key in keys { guard try engine.record(key).s("phase") == "active_unconfirmed", try engine.isMounted(key) else { throw DBError("请先完成全部目录挂载并检查应用内数据。") } }
                 var apps = store.apps, records = store.records
                 for key in keys { var app = apps.o(key), record = records.o(key); app["enabled"] = true; record["phase"] = "active"; record["user_confirmed"] = true; apps[key] = app; records[key] = record }
-                store.apps = apps; store.records = records; try store.save(); scheduleAutomatic()
+                store.apps = apps; store.records = records; try store.save()
                 return ["app_id": id, "phase": "active"]
             }
             if action == "delete_original" {
-                guard values.s("phrase") == "删除 " + store.apps.o(keys[0]).s("name") + " 备份" else { throw DBError("确认短语不一致，未清理。") }
+                guard values.s("phrase") == deletionConfirmation else { throw DBError("请输入「确认删除」，未清理。") }
                 for key in keys where isDirectory(store.records.o(key).s("original")) { _ = try engine.deleteOriginal(key) }
             }
             if action == "unmount" {
@@ -296,7 +341,7 @@ final class NativeService {
                     var ledger = try readObject(runtime.appendingPathComponent("opened.json"), fallback: [:]); ledger[id] = token; try writeObject(ledger, to: runtime.appendingPathComponent("opened.json"))
                 }
             }
-            if values.b("auto_mount") { _ = stateLock.locked { suspended.remove(id) }; scheduleAutomatic() }
+            if values.b("auto_mount") { _ = stateLock.locked { suspended.remove(id) }; scheduleAutomatic(appIDs: [id]) }
             return ["app_id": id]
         case "set_preferences":
             let store = try NativeStore(root); var prefs = store.config.o("preferences")
@@ -311,12 +356,8 @@ final class NativeService {
             return preferences(store)
         case "estimate":
             let store = try NativeStore(root), id = values.s("app_id"), keys = groupKeys(store, id)
-            let paths = keys.isEmpty ? candidatesFor(try findApplication(id, task: task), system: system).filter { !$0.b("shared") }.map { $0.s("path") } : keys.map { store.apps.o($0).s("mount_point") }
-            var amount: Int64 = 0
-            for path in paths { amount += totals(try inventory(path, task: task)).n("bytes") }
-            var sizes = (try? readObject(runtime.appendingPathComponent("sizes.json"), fallback: [:])) ?? [:]
-            sizes[id] = ["bytes": amount, "measured_ns": stamp()]; try writeObject(sizes, to: runtime.appendingPathComponent("sizes.json"))
-            return ["app_id": id, "bytes": amount]
+            let app = keys.isEmpty ? try findApplication(id, task: task) : store.apps.o(keys[0])
+            return try measureApplication(id, app: app, task: task)
         case "mount", "prepare_launch":
             let id = values.s("app_id")
             stateLock.locked { if id.isEmpty { suspended.removeAll() } else { suspended.remove(id) } }
@@ -347,7 +388,7 @@ final class NativeService {
             let store = try NativeStore(root), id = values.s("app_id")
             var archives = store.state.o("archives"), item = archives.o(id), record = item.o("record")
             let app = item.o("app")
-            guard !item.isEmpty, record.s("phase") == "rolled_back", values.s("phrase") == "删除 " + app.s("name") + " 备份" else { throw DBError("旧原件备份身份或确认短语不符合清理条件。") }
+            guard !item.isEmpty, record.s("phase") == "rolled_back", values.s("phrase") == deletionConfirmation else { throw DBError("旧原件备份身份或确认短语不符合清理条件。") }
             let changes = try NativeEngine(store, system: system, task: task).removeOriginalBackup(app, record: record)
             record.merge(changes) { _, b in b }; item["record"] = record; archives[id] = item; store.state["archives"] = archives; try store.save()
             return ["archive_id": id]
@@ -428,7 +469,7 @@ final class NativeService {
             }
         }
         scheduleAutomatic()
-        var heartbeat = Date.distantPast, volumeCheck = Date.distantPast, prior: Set<String>?
+        var heartbeat = Date.distantPast, volumeCheck = Date.distantPast, prior: Set<String>?, targetConnections: Set<String>?
         while true {
             receive()
             if Date().timeIntervalSince(heartbeat) >= 5 {
@@ -438,9 +479,16 @@ final class NativeService {
                 let current = Set(((try? nativeFM.contentsOfDirectory(atPath: "/Volumes")) ?? []).compactMap { name -> String? in
                     guard let value = try? fileStat("/Volumes/" + name), !isLink("/Volumes/" + name) else { return nil }; return name + ":" + String(value.st_dev)
                 })
-                if let prior, prior != current {
-                    if !current.subtracting(prior).isEmpty { stateLock.locked { suspended.removeAll() } }
-                    scheduleAutomatic()
+                if prior != current, let store = try? NativeStore(root), let disks = try? system.volumes() {
+                    let connections = automaticConnectionTokens(store, volumes: disks)
+                    if let previous = targetConnections, !connections.subtracting(previous).isEmpty {
+                        let reconnected = connections.subtracting(previous)
+                        let ids = Set(store.apps.keys.filter { key in
+                            reconnected.contains { $0.hasPrefix(store.apps.o(key).s("volume_uuid").lowercased() + ":") }
+                        }.map { groupID($0, app: store.apps.o($0)) })
+                        stateLock.locked { suspended.subtract(ids) }; scheduleAutomatic(appIDs: ids)
+                    }
+                    targetConnections = connections
                 }
                 prior = current; volumeCheck = Date()
             }

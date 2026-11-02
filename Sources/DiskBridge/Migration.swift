@@ -98,7 +98,7 @@ final class NativeEngine {
     }
     func isMounted(_ key: String) throws -> Bool {
         let app = try app(key), record = try record(key), source = app.s("mount_point")
-        guard mounted(source) else { return false }
+        guard system.isMountPoint(source) else { return false }
         try owned(record, at: source)
         guard let actual = try system.imageAt(source), normalized(actual) == (try image(key)) else { throw DBError("原路径挂载的是其他镜像，未覆盖或卸载。") }
         if !record.s("image_volume_uuid").isEmpty {
@@ -158,6 +158,7 @@ final class NativeEngine {
         let requiredBytes = Double(size.n("bytes")) * 1.2 + 268_435_456.0
         guard capacityBytes >= requiredBytes else { throw DBError("镜像逻辑容量不足。") }
         let image = try image(key)
+        try system.checkDestinationDirectory(disk.s("path"), folder: app.s("folder"))
         if old.isEmpty {
             guard !exists(image) else { throw DBError("目标已有镜像，未覆盖。请重新选择目录。") }
             let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()

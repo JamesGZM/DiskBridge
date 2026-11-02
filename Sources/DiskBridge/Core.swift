@@ -6,6 +6,7 @@ import Darwin
 typealias Object = [String: Any]
 let nativeFM = FileManager.default
 let volumeMarker = ".appdatamount-volume.json"
+let deletionConfirmation = "确认删除"
 let ignoredVolumeItems: Set<String> = [volumeMarker, ".fseventsd", ".Spotlight-V100", ".Trashes", ".TemporaryItems"]
 
 extension Dictionary where Key == String, Value == Any {
@@ -119,7 +120,8 @@ final class NativeLock {
             close(fd); fd = -1
             let owner = (try? readObject(url)) ?? [:]
             let elapsed = max(0, (stamp() - owner.n("started_ns")) / 1_000_000_000)
-            throw DBError("\(owner.s("operation", "另一个任务"))正在执行（进程 \(owner.n("pid"))，\(elapsed) 秒），稍后自动重试。", "busy")
+            let operation = owner.s("operation", "另一个任务"), name = actionNames[operation] ?? operation
+            throw DBError("「\(name)」正在执行（已用 \(elapsed) 秒），完成后将自动继续。", "busy")
         }
         let data = try JSONSerialization.data(withJSONObject: ["pid": getpid(), "operation": label, "started_ns": stamp()])
         _ = ftruncate(fd, 0); _ = lseek(fd, 0, SEEK_SET)
@@ -245,25 +247,88 @@ class NativeSystem {
         return object
     }
     func diskInfo(_ path: String) throws -> Object { try plist("/usr/sbin/diskutil", ["info", "-plist", path]) }
+    func isMountPoint(_ path: String) -> Bool { mounted(path) }
+    func validateDestinationRole(_ info: Object) throws {
+        guard info.s("FilesystemType").lowercased() == "apfs" else { return }
+        let container = info.s("APFSContainerReference")
+        let listing = try plist("/usr/sbin/diskutil", ["apfs", "list", "-plist"] + (container.isEmpty ? [] : [container]))
+        let volumes = listing.list("Containers").flatMap { $0.list("Volumes") }
+        guard let volume = volumes.first(where: { $0.s("APFSVolumeUUID").lowercased() == info.s("VolumeUUID").lowercased() }),
+              let roles = volume["Roles"] as? [String] else {
+            throw DBError("无法确认目标 APFS 卷的用途，请重新选择外置数据盘。", "invalid_destination")
+        }
+        guard roles.isEmpty else {
+            throw DBError("\(info.s("VolumeName", "所选磁盘")) 是系统或专用用途卷，不能作为迁移目标。请选择外置数据盘。", "invalid_destination")
+        }
+    }
+    func checkDestinationDirectory(_ root: String, folder: String) throws {
+        let folder = try relativeFolder(folder), root = normalized(root)
+        var created: [String] = []
+        defer { for path in created.reversed() { _ = rmdir(path) } }
+        do {
+            guard !isLink(root), isDirectory(root) else { throw DBError("目标磁盘路径不是普通目录。", "invalid_destination") }
+            let device = try fileStat(root).st_dev
+            var path = root
+            for component in folder.split(separator: "/") {
+                path += "/" + component
+                if !exists(path) {
+                    guard mkdir(path, 0o700) == 0 else { throw DBError("无法创建目标目录。") }
+                    created.append(path)
+                }
+                guard !isLink(path), isDirectory(path), try fileStat(path).st_dev == device else {
+                    throw DBError("目标目录包含符号链接、其他挂载卷或非目录文件，请选择普通目录。", "invalid_destination")
+                }
+            }
+            let probe = path + "/.diskbridge-write-check-" + UUID().uuidString
+            let fd = Darwin.open(probe, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o600)
+            guard fd >= 0 else { throw DBError("无法写入目标目录。") }
+            defer { close(fd); unlink(probe) }
+            var byte: UInt8 = 0
+            guard Darwin.write(fd, &byte, 1) == 1, fsync(fd) == 0 else { throw DBError("目标目录写入检查失败。") }
+        } catch let error as DBError where error.reason == "invalid_destination" { throw error }
+        catch {
+            throw DBError("无法写入目标目录 \(root)/\(folder)。请检查所选磁盘、目录权限及剩余空间；尚未切换原数据。", "destination_unwritable")
+        }
+    }
     func volume(_ uuid: String) throws -> Object {
         let info: Object
         do { info = try diskInfo(uuid) } catch let error as DBError where error.reason == "authorization" { throw error }
         catch { throw DBError("等待连接目标外置硬盘；不会用同名硬盘替代。", "disk_not_ready") }
         guard info.s("VolumeUUID").lowercased() == uuid.lowercased() else { throw DBError("目标硬盘 UUID 不匹配。") }
+        try validateDestinationRole(info)
         let path = info.s("MountPoint")
         guard !path.isEmpty, mounted(path) else { throw DBError("目标外置硬盘尚未挂载。", "disk_not_ready") }
         guard !info.b("Internal", true), info.s("BusProtocol") != "Disk Image", info.b("WritableVolume", info.b("Writable")),
               try fileStat(path).st_dev != fileStat("/System/Volumes/Data").st_dev else { throw DBError("目标必须是可写的外置物理盘。") }
         let capacity = ((try? nativeFM.attributesOfFileSystem(forPath: path)[.systemSize]) as? NSNumber)?.int64Value ?? 0
-        return ["uuid": uuid, "name": info.s("VolumeName", URL(fileURLWithPath: path).lastPathComponent), "path": path, "free": freeBytes(path), "capacity": capacity, "filesystem": info.s("FilesystemType", "APFS")]
+        return ["uuid": uuid, "name": info.s("VolumeName", URL(fileURLWithPath: path).lastPathComponent), "path": path, "device": info.s("DeviceIdentifier"), "free": freeBytes(path), "capacity": capacity, "filesystem": info.s("FilesystemType", "APFS")]
     }
-    func volumes() throws -> [Object] {
-        try nativeFM.contentsOfDirectory(atPath: "/Volumes").compactMap { name in
+    func volumes(onVolume: ((Object) -> Void)? = nil) throws -> [Object] {
+        var result: [Object] = []
+        for name in try nativeFM.contentsOfDirectory(atPath: "/Volumes").sorted() {
             let path = "/Volumes/" + name
-            guard !isLink(path), mounted(path), let info = try? diskInfo(path), !info.s("VolumeUUID").isEmpty else { return nil }
-            return try? volume(info.s("VolumeUUID"))
+            guard !isLink(path), mounted(path), let info = try? diskInfo(path), !info.s("VolumeUUID").isEmpty,
+                  let value = try? volume(info.s("VolumeUUID")) else { continue }
+            result.append(value); onVolume?(value)
         }
+        return result
     }
+    func dataBytes(_ paths: [String], task: NativeTask) throws -> Int64 {
+        var amount: Int64 = 0
+        for path in paths {
+            try task.check()
+            let data: Data
+            do { data = try run("/usr/bin/du", ["-skx", path], timeout: 120, task: task) }
+            catch let error as DBError where error.reason == "authorization" {
+                throw DBError("部分数据目录受系统或文件权限保护，暂时无法读取完整大小；可在权限或应用状态变化后重试。", "measurement_unavailable")
+            }
+            guard let word = String(decoding: data, as: UTF8.self).split(whereSeparator: { $0.isWhitespace }).first,
+                  let kib = Int64(word), kib >= 0, kib <= (Int64.max - amount) / 1024 else { throw DBError("无法读取应用数据占用。") }
+            amount += kib * 1024
+        }
+        return amount
+    }
+    func dataCandidates(_ app: Object) -> [Object] { candidatesFor(app, system: self) }
     func running(_ app: Object) -> Bool {
         let bundle = app.s("bundle_id")
         if !bundle.isEmpty && NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == bundle }) { return true }
@@ -317,6 +382,9 @@ func sourcePath(_ value: String) throws -> String {
     guard value.hasPrefix("/"), url.resolvingSymlinksInPath().path == path,
           !["/", home, home + "/Library", home + "/Documents", "/Volumes"].contains(path), url.pathComponents.count >= 5 else {
         throw DBError("数据路径范围过大或包含软链接，请选择应用的具体数据目录。")
+    }
+    guard path.range(of: #"/Library/Containers/[^/]+/Data/SystemData(?:/|$)"#, options: .regularExpression) == nil else {
+        throw DBError("SystemData 由 macOS 管理，不能作为应用数据迁移。请选择应用自己的具体数据目录。")
     }
     return path
 }

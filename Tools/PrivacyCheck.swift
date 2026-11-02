@@ -11,7 +11,7 @@ func git(_ arguments: [String]) throws -> Data {
 }
 
 let root = URL(fileURLWithPath: String(decoding: try git(["rev-parse", "--show-toplevel"]), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
-let files = String(decoding: try git(["ls-files", "-z"]), as: UTF8.self).split(separator: "\0").map(String.init)
+let files = String(decoding: try git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"]), as: UTF8.self).split(separator: "\0").map(String.init)
 let forbiddenNames: Set<String> = ["config.json", "state.json", "signing-identity.txt", ".DS_Store", ".env"]
 let forbiddenExtensions: Set<String> = ["p12", "pfx", "pem", "key", "cer", "mobileprovision", "dmg", "zip", "log"]
 let rules: [(String, NSRegularExpression)] = try [
@@ -46,5 +46,5 @@ for path in files {
         }
     }
 }
-print("Checked \(files.count) tracked text files; \(findings) findings.")
+print("Checked \(files.count) project text files; \(findings) findings.")
 exit(findings == 0 ? 0 : 1)

@@ -8,17 +8,71 @@ func formattedBytes(_ value: Any?) -> String {
     return ByteCountFormatter.string(fromByteCount: value.int64Value, countStyle: .file)
 }
 let actionNames: [String: String] = ["migrate": "迁移应用", "rollback": "还原到内置硬盘", "recover": "继续任务", "mount": "挂载应用", "automatic": "自动挂载",
-    "confirm": "应用验收", "delete_original": "清理原件备份", "delete_archived_original": "清理旧原件备份", "delete_retained": "清理外置副本", "unmount": "安全卸载", "plan": "统计迁移范围", "rollback_plan": "还原预览", "estimate": "统计数据大小", "prepare_launch": "挂载就绪后打开"]
+    "confirm": "应用验收", "delete_original": "清理原件备份", "delete_archived_original": "清理旧原件备份", "delete_retained": "清理外置副本", "unmount": "安全卸载", "plan": "统计迁移范围", "rollback_plan": "还原预览", "estimate": "统计数据大小", "scan_sizes": "读取应用数据大小", "prepare_launch": "挂载就绪后打开"]
 struct BridgeApp: Identifiable {
     let value: Object
+    let searchTerms: [String]
+    let sortName: String
+    init(value: Object) {
+        self.value = value
+        let pathName = value.s("app_path").isEmpty ? "" : URL(fileURLWithPath: value.s("app_path")).deletingPathExtension().lastPathComponent
+        let names = (value["aliases"] as? [String] ?? []) + [value.s("name"), value.s("bundle_name"), value.s("file_name"), value.s("executable_name"), pathName]
+        searchTerms = value["search_terms"] as? [String] ?? Array(Set(names.filter { !$0.isEmpty }.flatMap { applicationSearchTerms($0) }))
+        sortName = value["sort_name"] as? String ?? applicationSearchText(value.s("name").applyingTransform(.toLatin, reverse: false) ?? value.s("name"))
+    }
+    private init(value: Object, terms: [String], sortName: String) { self.value = value; self.searchTerms = terms; self.sortName = sortName }
+    func updating(_ value: Object) -> BridgeApp { BridgeApp(value: value, terms: searchTerms, sortName: sortName) }
     var id: String { value.s("id") }
     var name: String { value.s("name") }
     var paths: [Object] { value.list("paths") }
     var migrated: Bool { value.s("migration_state") == "migrated" }
     var pending: Bool { value.s("migration_state") == "pending" }
+    var relocated: Bool { migrated || pending }
     var incomplete: Bool { value.s("migration_state") == "incomplete" }
     var stateName: String { migrated ? "已迁移" : pending ? "待验收" : incomplete ? "待恢复" : "未迁移" }
     var mounted: Bool { value.b("mounted") }
+    var activePaths: [Object] { (relocated || incomplete) ? paths.filter { $0.s("phase") != "rolled_back" } : [] }
+    var installedDate: Date? { (value["installed_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) } }
+    func matches(_ query: String) -> Bool {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty { return true }
+        if query.contains("/") { return value.s("app_path").localizedCaseInsensitiveContains(query) }
+        let needle = applicationSearchText(query)
+        guard !needle.isEmpty else { return false }
+        return searchTerms.contains { term in
+            if term.contains(needle) { return true }
+            var next = needle.startIndex
+            for letter in term where next < needle.endIndex { if letter == needle[next] { next = needle.index(after: next) } }
+            return next == needle.endIndex
+        } || (query.contains(".") && value.s("bundle_id").localizedCaseInsensitiveContains(query))
+    }
+}
+func applicationSearchText(_ text: String) -> String {
+    text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX")).unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(String.init).joined()
+}
+func applicationSearchTerms(_ text: String) -> [String] {
+    let words = text.replacingOccurrences(of: "([a-z0-9])([A-Z])", with: "$1 $2", options: .regularExpression)
+    let latin = words.applyingTransform(.toLatin, reverse: false) ?? words
+    let initials = latin.components(separatedBy: CharacterSet.alphanumerics.inverted).compactMap(\.first).map(String.init).joined()
+    return [applicationSearchText(text), applicationSearchText(latin), applicationSearchText(initials)].filter { !$0.isEmpty }
+}
+struct ApplicationSort: SortComparator {
+    var field: String
+    var order: SortOrder
+    init(_ field: String) { self.field = field; order = field == "name" ? .forward : .reverse }
+    func compare(_ lhs: BridgeApp, _ rhs: BridgeApp) -> ComparisonResult {
+        if field == "size" || field == "installed" {
+            let key = field == "size" ? "bytes" : "installed_at", a = lhs.value[key] as? NSNumber, b = rhs.value[key] as? NSNumber
+            if (a == nil) != (b == nil) { return a == nil ? .orderedDescending : .orderedAscending }
+            if let a, let b, a != b {
+                let less = a.doubleValue < b.doubleValue
+                return (order == .forward ? less : !less) ? .orderedAscending : .orderedDescending
+            }
+        }
+        let names = lhs.sortName.localizedStandardCompare(rhs.sortName)
+        if names != .orderedSame { return names }
+        return lhs.id.compare(rhs.id)
+    }
 }
 struct BridgeTask: Identifiable {
     let value: Object
@@ -50,8 +104,7 @@ final class BridgeModel: ObservableObject {
     @Published var search = ""
     @Published var filter = "all"
     @Published var taskFilter = "all"
-    @Published var sortField = UserDefaults.standard.string(forKey: "sortField") ?? "name" { didSet { UserDefaults.standard.set(sortField, forKey: "sortField") } }
-    @Published var ascending = UserDefaults.standard.object(forKey: "ascending") as? Bool ?? true { didSet { UserDefaults.standard.set(ascending, forKey: "ascending") } }
+    @Published var sortField = "name"
     @Published var loading = false
     @Published var error = ""
     @Published var needsAuthorization = false
@@ -66,47 +119,116 @@ final class BridgeModel: ObservableObject {
     @Published var targetFolder = ""
     @Published var sharedConfirmed = false
     @Published var taskDetail: Object = [:]
+    @Published var clearingTasks = false
+    @Published var disksLoading = false
+    var measurementVersion: Int64 = 0
     var callbacks: [String: (Object) -> Void] = [:], pendingDates: [String: Date] = [:]
     var timer: Timer?, lastHistory = Date.distantPast, lastStatus = Date.distantPast
     var automaticVersion: Int64 = 0
     var statusPending = false
     var authorizationPrompted = false
+    let snapshotQueue = DispatchQueue(label: "DiskBridge.AppListCache", qos: .utility)
+    var snapshotWork: DispatchWorkItem?
     var openSettings: () -> Void = {}, openAuthorization: () -> Void = {}, refreshRegistration: () -> Void = {}, recheckAuthorization: () -> Void = {}, onAuthorizationRequired: () -> Void = {}
 
     init(root: URL, runtime: URL) {
         self.root = root; self.runtime = runtime
         diskHistory = (try? readObject(runtime.appendingPathComponent("disks.json"), fallback: [:])) ?? [:]
+        if let saved = try? readObject(runtime.appendingPathComponent("app-list.json")), saved.n("version") == 1 {
+            apps = saved.list("apps").map { row in
+                var value = row
+                if value.b("managed") {
+                    value["mounted"] = false; value["status_cached"] = true
+                    value["availability_note"] = "正在后台核对缓存中的迁移状态。"
+                }
+                return BridgeApp(value: value)
+            }
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.poll() }
     }
+    deinit { timer?.invalidate(); snapshotWork?.cancel() }
     var activeCount: Int { tasks.filter(\.active).count }
+    func saveAppSnapshot() {
+        let rows = apps.map(\.value), url = runtime.appendingPathComponent("app-list.json")
+        snapshotWork?.cancel()
+        let work = DispatchWorkItem { try? writeObject(["version": 1, "apps": rows, "saved_ns": stamp()], to: url) }
+        snapshotWork = work; snapshotQueue.asyncAfter(deadline: .now() + 0.2, execute: work)
+    }
+    var measuringSizes: Bool { tasks.contains { $0.active && $0.value.s("action") == "scan_sizes" } }
+    func applyMeasurements(_ sizes: Object) {
+        apps = apps.map { app in
+            let row = sizes.o(app.id)
+            guard row.n("version") == 2, row.s("location") == app.value.s("data_location", "internal"), row.n("updated_ns") != app.value.n("measurement_ns") else { return app }
+            var value = app.value
+            if let bytes = row["bytes"] as? NSNumber { value["bytes"] = bytes }
+            else if row.s("status") == "not_found" { value["bytes"] = NSNull() }
+            value["size_status"] = row.s("status"); value["size_note"] = row.s("note")
+            value["measurement_ns"] = row.n("updated_ns")
+            return app.updating(value)
+        }
+        saveAppSnapshot()
+    }
+    func applyDisks(_ result: [Object]) {
+        disks = result
+        for disk in result { diskHistory[disk.s("uuid")] = disk }
+        if targetDisk.isEmpty { targetDisk = result.first?.s("uuid") ?? "" }
+    }
+    func mergeOverviewApps(_ rows: [Object]) {
+        var previous: [String: BridgeApp] = [:], merged: [String: BridgeApp] = [:]
+        for app in apps { previous[app.id] = app; if !app.value.b("managed") { merged[app.id] = app } }
+        for row in rows {
+            let id = row.s("id")
+            var value = previous[id]?.value ?? [:]
+            value.merge(row) { _, current in current }; value.removeValue(forKey: "measurement_ns")
+            value.removeValue(forKey: "status_cached")
+            merged[id] = BridgeApp(value: value)
+        }
+        apps = Array(merged.values)
+        if let sizes = try? readObject(runtime.appendingPathComponent("sizes.json")) { applyMeasurements(sizes) }
+        else { saveAppSnapshot() }
+    }
     var visibleApps: [BridgeApp] {
-        let values = apps.filter { (search.isEmpty || ($0.name + " " + $0.value.s("app_path")).localizedCaseInsensitiveContains(search)) &&
-            (filter == "all" || (filter == "migrated" ? $0.migrated : $0.value.s("migration_state") == "unmigrated")) }
-        return values.sorted { a, b in
-            if sortField == "size" {
-                let left = a.value["bytes"] as? NSNumber, right = b.value["bytes"] as? NSNumber
-                if left == nil || right == nil { if left == nil && right != nil { return false }; if right == nil && left != nil { return true } }
-                if a.value.n("bytes") != b.value.n("bytes") { return ascending ? a.value.n("bytes") < b.value.n("bytes") : a.value.n("bytes") > b.value.n("bytes") }
-            }
-            if sortField == "state" && a.stateName != b.stateName { return ascending ? a.stateName < b.stateName : a.stateName > b.stateName }
-            return ascending ? a.name.localizedStandardCompare(b.name) == .orderedAscending : a.name.localizedStandardCompare(b.name) == .orderedDescending
+        let values = apps.filter { $0.matches(search) &&
+            (filter == "all" || (filter == "migrated" ? $0.relocated : $0.value.s("migration_state") == "unmigrated")) }
+        return values.sorted(using: ApplicationSort(sortField))
+    }
+    var tableSort: [ApplicationSort] {
+        get { [ApplicationSort(sortField)] }
+        set { if let field = newValue.first?.field { sortField = field } }
+    }
+    var migratedApps: [BridgeApp] { apps.filter(\.relocated) }
+    func clearTasks(_ id: String? = nil) {
+        clearingTasks = true
+        var values: Object = ["exclude_ids": Array(callbacks.keys)]
+        if let id { values["task_id"] = id }
+        send("clear_tasks", values) { response in
+            self.clearingTasks = false
+            let removed = Set(response.o("result")["removed_ids"] as? [String] ?? [])
+            self.tasks.removeAll { removed.contains($0.id) }
+            if let selected = self.selectedTask, removed.contains(selected) { self.selectedTask = nil; self.taskDetail = [:] }
+            self.lastHistory = .distantPast
         }
     }
-    var migratedApps: [BridgeApp] { apps.filter(\.migrated) }
     var knownDisks: [Object] {
-        var known = diskHistory
-        for app in apps { for path in app.paths where known[path.s("volume_uuid")] == nil {
-            known[path.s("volume_uuid")] = ["uuid": path.s("volume_uuid"), "name": "已配置外置硬盘"]
+        var known: Object = [:]
+        for disk in disks { known[disk.s("uuid").lowercased()] = disk }
+        for app in apps { for path in app.activePaths where known[path.s("volume_uuid").lowercased()] == nil {
+            let uuid = path.s("volume_uuid")
+            known[uuid.lowercased()] = diskHistory.values.compactMap { $0 as? Object }.first { $0.s("uuid").lowercased() == uuid.lowercased() } ?? ["uuid": uuid, "name": path.s("volume_name", "已配置外置硬盘")]
         } }
         return known.values.compactMap { $0 as? Object }.sorted { $0.s("name").localizedStandardCompare($1.s("name")) == .orderedAscending }
     }
+    func relatedApps(_ uuid: String) -> [BridgeApp] { apps.filter { $0.activePaths.contains { $0.s("volume_uuid").lowercased() == uuid.lowercased() } } }
+    func appDestination(_ app: BridgeApp) -> String { app.activePaths.first.map(destination) ?? "本机" }
     func authorization(_ required: Bool) {
         needsAuthorization = required; authorizationChecked = true
         if required && !authorizationPrompted { authorizationPrompted = true; onAuthorizationRequired() }
     }
     func destination(_ path: Object) -> String {
         let disk = disks.first { $0.s("uuid").lowercased() == path.s("volume_uuid").lowercased() }
-        return (disk?.s("name") ?? "离线硬盘") + " / " + path.s("folder")
+        let previous = diskHistory.values.compactMap { $0 as? Object }.first { $0.s("uuid").lowercased() == path.s("volume_uuid").lowercased() }
+        let name = disk?.s("name") ?? previous?.s("name") ?? path.s("volume_name", "外置硬盘")
+        return name + (disk == nil ? (disksLoading ? "（读取中）" : "（未连接）") : "") + " / " + path.s("folder")
     }
     var visibleTasks: [BridgeTask] { tasks.filter { taskFilter == "all" || (taskFilter == "active" ? $0.active : taskFilter == "complete" ? $0.phase == "complete" : $0.attention) } }
     func send(_ action: String, _ values: Object = [:], visible: Bool = false, completion: @escaping (Object) -> Void = { _ in }) {
@@ -129,12 +251,16 @@ final class BridgeModel: ObservableObject {
                     error = "后台尚未接收任务，请在设置中检查原生后台和授权。"; loading = false; planBusy = false
                 }; continue
             }
+            if row.s("action") == "disks", let partial = row["result"] as? [Object] { applyDisks(partial) }
             if ["complete", "failed", "stopped", "interrupted"].contains(row.s("phase")) {
                 callbacks.removeValue(forKey: id); pendingDates.removeValue(forKey: id)
                 if row.s("phase") != "complete" { error = row.s("message"); if row.s("reason") == "authorization" { authorization(true) } }
                 callback(row)
                 if !publicTaskAction(row.s("action")) { try? nativeFM.removeItem(at: runtime.appendingPathComponent("tasks/\(id).json")) }
             }
+        }
+        if let sizes = try? readObject(runtime.appendingPathComponent("sizes.json")), sizes.n("_updated_ns") != measurementVersion {
+            measurementVersion = sizes.n("_updated_ns"); applyMeasurements(sizes)
         }
         if Date().timeIntervalSince(lastHistory) >= 1 {
             let urls = (try? nativeFM.contentsOfDirectory(at: runtime.appendingPathComponent("history"), includingPropertiesForKeys: nil)) ?? []
@@ -148,26 +274,27 @@ final class BridgeModel: ObservableObject {
             send("overview") { response in
                 self.statusPending = false
                 guard let result = response["result"] as? Object else { return }
-                let managed = result.list("apps").map { BridgeApp(value: $0) }
-                self.apps = self.apps.filter { !$0.value.b("managed") } + managed
+                self.mergeOverviewApps(result.list("apps"))
                 if result.b("requires_authorization") { self.authorization(true) }
             }
         }
     }
     func refresh(forceCatalog: Bool = false) {
-        loading = true
-        send("catalog") { response in
+        guard !loading else { return }
+        loading = true; disksLoading = true
+        send("catalog", ["force": forceCatalog]) { response in
             self.loading = false
             guard let result = response["result"] as? Object else { return }
             self.apps = result.list("apps").map { BridgeApp(value: $0) }; self.preferences = result.o("preferences")
+            if let sizes = try? readObject(self.runtime.appendingPathComponent("sizes.json")) { self.applyMeasurements(sizes) }
+            else { self.saveAppSnapshot() }
             self.retained = result.list("retained_copies"); if result.b("requires_authorization") { self.authorization(true) }
             self.archivedBackups = result.list("archived_backups").map { BridgeApp(value: $0) }
         }
         send("disks") { response in
-            self.disks = response["result"] as? [Object] ?? []
-            for disk in self.disks { self.diskHistory[disk.s("uuid")] = disk }
+            self.disksLoading = false
+            self.applyDisks(response["result"] as? [Object] ?? [])
             try? writeObject(self.diskHistory, to: self.runtime.appendingPathComponent("disks.json"))
-            if self.targetDisk.isEmpty { self.targetDisk = self.disks.first?.s("uuid") ?? "" }
         }
     }
     func beginFlow(_ app: BridgeApp) {

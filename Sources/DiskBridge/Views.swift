@@ -19,9 +19,9 @@ struct MigrationStatusView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(app.stateName).font(.callout)
-            if app.migrated {
-                Label(app.mounted ? "挂载就绪" : "等待挂载", systemImage: app.mounted ? "checkmark.circle" : "clock")
-                    .font(.caption).foregroundStyle(app.mounted ? Color.secondary : Color.orange)
+            if app.relocated {
+                Label(app.value.b("status_cached") ? "核对中" : app.mounted ? "挂载就绪" : "等待挂载", systemImage: app.mounted ? "checkmark.circle" : "clock")
+                    .font(.caption).foregroundStyle(app.mounted || app.value.b("status_cached") ? Color.secondary : Color.orange)
                     .help(app.value.s("availability_note"))
             }
         }
@@ -35,6 +35,7 @@ struct BridgeView: View {
     @State private var clearingCopy: Object?
     @State private var showCopyCleanup = false
     @State private var unmounting: BridgeApp?
+    @State private var showTaskCleanup = false
     var body: some View {
         NavigationSplitView {
             List(selection: $model.page) {
@@ -72,11 +73,14 @@ struct BridgeView: View {
         .frame(minWidth: 1000, minHeight: 650)
         .toolbar {
             ToolbarItem { if model.loading { ProgressView().controlSize(.small) } }
-            ToolbarItem { Button { model.refresh() } label: { Label("刷新", systemImage: "arrow.clockwise") }.help("刷新应用和挂载状态") }
+            ToolbarItem { Button { model.refresh(forceCatalog: true) } label: { Label("刷新", systemImage: "arrow.clockwise") }.help("手动重新扫描应用；通常直接使用缓存并后台核对") }
         }
         .sheet(item: $model.flow) { flow in WorkflowSheet(model: model, flow: flow) }
         .sheet(item: $cleaning) { app in OriginalCleanupSheet(model: model, app: app) }
         .sheet(isPresented: $showCopyCleanup) { if let copy = clearingCopy { RetainedCleanupSheet(model: model, copy: copy) } }
+        .confirmationDialog("清理已结束的任务记录？", isPresented: $showTaskCleanup) {
+            Button("清理已结束任务", role: .destructive) { model.clearTasks() }
+        } message: { Text("清理已完成、失败及已停止的任务列表记录。进行中的任务、应用迁移配置、数据和原件备份均保留。") }
         .confirmationDialog("安全卸载应用数据？", isPresented: Binding(get: { unmounting != nil }, set: { if !$0 { unmounting = nil } })) {
             if let app = unmounting { Button("卸载 \(app.name) 数据卷") { model.perform("unmount", app: app, values: ["confirmed": true]); unmounting = nil } }
         } message: { Text("请先完全退出应用。盘桥会保留挂载点保护，等待你重新挂载后再使用应用。") }
@@ -85,19 +89,27 @@ struct BridgeView: View {
     var applicationManager: some View {
         VStack(spacing: 12) {
             HStack(spacing: 12) {
-                TextField("搜索应用名称或路径", text: $model.search).textFieldStyle(.roundedBorder).frame(maxWidth: 340)
+                TextField("搜索名称、缩写或拼音", text: $model.search).textFieldStyle(.roundedBorder).frame(maxWidth: 280)
                 Picker("筛选", selection: $model.filter) { Text("全部").tag("all"); Text("未迁移").tag("unmigrated"); Text("已迁移").tag("migrated") }.pickerStyle(.segmented).labelsHidden().frame(width: 220)
                 Spacer()
                 Menu {
-                    Picker("排序方式", selection: $model.sortField) { Text("名称").tag("name"); Text("数据大小").tag("size"); Text("迁移状态").tag("state") }
-                    Divider(); Toggle("升序", isOn: $model.ascending)
+                    Picker("排序方式", selection: $model.sortField) { Text("名称").tag("name"); Text("数据大小 · 大到小").tag("size"); Text("安装时间 · 最近优先").tag("installed") }
                 } label: { Label("排序", systemImage: "arrow.up.arrow.down") }
+                Button { model.send("request_sizes") } label: { Label(model.measuringSizes ? "后台读取中" : "读取数据大小", systemImage: "arrow.clockwise") }.disabled(model.measuringSizes)
             }.padding(.horizontal, 18)
-            Table(model.visibleApps, selection: $model.selection) {
-                TableColumn("应用") { app in Button { model.beginFlow(app) } label: { AppIdentityView(app: app).frame(maxWidth: .infinity, alignment: .leading) }.buttonStyle(.plain) }.width(min: 210, ideal: 285)
+            Table(model.visibleApps, selection: $model.selection, sortOrder: $model.tableSort) {
+                TableColumn("应用", sortUsing: ApplicationSort("name")) { app in Button { model.beginFlow(app) } label: { AppIdentityView(app: app).frame(maxWidth: .infinity, alignment: .leading) }.buttonStyle(.plain) }.width(min: 185, ideal: 240)
                 TableColumn("迁移状态") { app in MigrationStatusView(app: app) }.width(min: 100, ideal: 120, max: 150)
-                TableColumn("数据大小") { app in Text(formattedBytes(app.value["bytes"])).monospacedDigit().help(app.value.s("size_note", "按需统计，尚未统计时显示 —")) }.width(min: 90, ideal: 110, max: 140)
-                TableColumn("目标硬盘 / 目录") { app in Text(app.paths.first.map(model.destination) ?? "—").foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle) }
+                TableColumn("数据大小", sortUsing: ApplicationSort("size")) { app in
+                    HStack(spacing: 5) {
+                        if app.value.s("size_status") == "reading" { ProgressView().controlSize(.mini) }
+                        Text(app.value["bytes"] is NSNumber ? formattedBytes(app.value["bytes"]) : app.value.b("own") ? "—" : app.value.s("size_status") == "reading" ? "读取中…" : app.value.s("size_status") == "not_found" ? "未发现数据" : app.value.s("size_status") == "unknown" ? "暂无法读取" : "待统计")
+                    }.monospacedDigit().help(app.value.s("size_note", "后台逐项读取可迁移数据，不包含应用本体。"))
+                }.width(min: 105, ideal: 125, max: 155)
+                TableColumn("安装时间", sortUsing: ApplicationSort("installed")) { app in
+                    Text(app.installedDate.map { $0.formatted(date: .numeric, time: .shortened) } ?? "未知").font(.callout).help(app.value.s("installed_date_source", "系统未提供安装时间。"))
+                }.width(min: 140, ideal: 165, max: 190)
+                TableColumn("目标硬盘 / 目录") { app in Text(model.appDestination(app)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle) }
             }
             .alternatingRowBackgrounds(.enabled)
             .contextMenu {
@@ -127,15 +139,28 @@ struct BridgeView: View {
     var migratedManager: some View {
         HSplitView {
             List(selection: $managedSelection) {
-                ForEach(model.migratedApps) { app in AppIdentityView(app: app).tag(app.id) }
+                ForEach(model.migratedApps) { app in
+                    VStack(alignment: .leading, spacing: 4) {
+                        AppIdentityView(app: app)
+                        Text(app.stateName).font(.caption).foregroundStyle(app.pending ? Color.orange : Color.secondary)
+                    }.tag(app.id)
+                }
             }.frame(minWidth: 220, idealWidth: 260, maxWidth: 320)
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     if let app = model.migratedApps.first(where: { $0.id == managedSelection }) ?? model.migratedApps.first {
                         AppIdentityView(app: app).font(.title3)
+                        if app.pending {
+                            GroupBox("迁移完成，待验收") {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("数据已迁移到外置硬盘。请打开应用检查旧记录与附件，确认正常后启用自动挂载。")
+                                    Button("检查并验收…") { model.beginFlow(app) }.buttonStyle(.borderedProminent)
+                                }.padding(8)
+                            }
+                        }
                         GroupBox("存储位置") {
                             VStack(alignment: .leading, spacing: 12) {
-                                Label(app.mounted ? "全部数据目录挂载就绪" : "等待硬盘或挂载", systemImage: app.mounted ? "checkmark.circle" : "clock")
+                                Label(app.value.b("status_cached") ? "正在核对挂载状态" : app.mounted ? "全部数据目录挂载就绪" : "等待硬盘或挂载", systemImage: app.mounted ? "checkmark.circle" : "clock")
                                 if !app.value.s("availability_note").isEmpty { Text(app.value.s("availability_note")).font(.caption).foregroundStyle(.secondary) }
                                 ForEach(app.paths.indices, id: \.self) { index in
                                     let path = app.paths[index]
@@ -148,12 +173,12 @@ struct BridgeView: View {
                                 }
                             }.padding(8).frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        GroupBox("自动化") {
+                        GroupBox(app.pending ? "自动化 · 验收后可用" : "自动化") {
                             VStack(alignment: .leading, spacing: 12) {
                                 Toggle("自动挂载", isOn: Binding(get: { app.value.b("auto_mount") }, set: { model.setting(app, "auto_mount", $0) }))
                                 Toggle("挂载后自动打开应用", isOn: Binding(get: { app.value.b("auto_open") }, set: { model.setting(app, "auto_open", $0) }))
                                 Text("默认不自动打开。开启后仅在挂载成功时打开一次；主动退出应用后不会再次打开。请避免与应用自身的开机启动重复。").font(.caption).foregroundStyle(.secondary)
-                            }.padding(8)
+                            }.padding(8).disabled(app.pending)
                         }
                         GroupBox("原件备份与空间") {
                             VStack(alignment: .leading, spacing: 10) {
@@ -164,7 +189,7 @@ struct BridgeView: View {
                                 if app.value.b("can_delete_original") { Button("清理原件备份…", role: .destructive) { cleaning = app } }
                             }.padding(8)
                         }
-                        HStack { Button("挂载就绪后打开") { model.openApp(app) }; Button("立即挂载") { model.perform("mount", app: app) }; Spacer(); Button("安全卸载…") { unmounting = app }; Button("还原到内置硬盘…") { model.beginFlow(app) } }
+                        HStack { Button("挂载就绪后打开") { model.openApp(app) }; Button("立即挂载") { model.perform("mount", app: app) }; Spacer(); Button("安全卸载…") { unmounting = app }; if app.migrated { Button("还原到内置硬盘…") { model.beginFlow(app) } } }
                     } else { ContentUnavailableView("没有已迁移应用", systemImage: "externaldrive", description: Text("完成迁移与应用验收后，会显示在这里。")) }
                     Button("管理历史备份与外置副本…") { model.page = "recovery" }
                 }.padding(22).frame(maxWidth: .infinity, alignment: .leading)
@@ -218,17 +243,18 @@ struct BridgeView: View {
     var storageManager: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                if model.knownDisks.isEmpty { ContentUnavailableView("连接外置硬盘", systemImage: "externaldrive.badge.plus", description: Text("连接可写的外置硬盘后，可在迁移流程中选择；默认目录为 Cache/应用名称。")) }
+                if model.disksLoading { HStack { ProgressView().controlSize(.small); Text("正在后台读取存储设备…").foregroundStyle(.secondary) } }
+                else if model.knownDisks.isEmpty { ContentUnavailableView("连接外置硬盘", systemImage: "externaldrive.badge.plus", description: Text("连接可写的外置硬盘后，可在迁移流程中选择；默认目录为 Cache/应用名称。")) }
                 ForEach(model.knownDisks.indices, id: \.self) { index in
                     let disk = model.knownDisks[index]
                     let current = model.disks.first { $0.s("uuid").lowercased() == disk.s("uuid").lowercased() }
-                    let related = model.apps.filter { $0.paths.contains { $0.s("volume_uuid").lowercased() == disk.s("uuid").lowercased() } }
+                    let related = model.relatedApps(disk.s("uuid"))
                     GroupBox {
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "externaldrive.fill").font(.title2).foregroundStyle(.secondary)
                                 Text(disk.s("name")).font(.headline); Spacer()
-                                Label(current == nil ? "未连接" : "已连接", systemImage: current == nil ? "eject" : "checkmark.circle").foregroundStyle(current == nil ? Color.secondary : Color.green)
+                                Label(current == nil ? (model.disksLoading ? "读取中" : "未连接") : "已连接", systemImage: current == nil ? (model.disksLoading ? "clock" : "eject") : "checkmark.circle").foregroundStyle(current == nil ? Color.secondary : Color.green)
                             }
                             if let current {
                                 let capacity = current.d("capacity"), free = current.d("free")
@@ -237,7 +263,7 @@ struct BridgeView: View {
                                 LabeledContent("格式", value: current.s("filesystem").uppercased())
                                 Button("在 Finder 中打开") { NSWorkspace.shared.open(URL(fileURLWithPath: current.s("path"))) }
                             }
-                            LabeledContent("关联应用", value: "\(related.count) 个")
+                            LabeledContent("当前关联应用", value: "\(related.count) 个")
                             ForEach(related) { app in HStack { AppIdentityView(app: app); Spacer(); Text(app.stateName).foregroundStyle(.secondary); if app.migrated { Button("应用设置") { managedSelection = app.id; model.page = "migrated" } } } }
                             Text("磁盘标识：" + disk.s("uuid")).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                         }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
@@ -251,7 +277,10 @@ struct BridgeView: View {
         VStack(spacing: 12) {
             HStack {
                 Picker("任务筛选", selection: $model.taskFilter) { Text("全部").tag("all"); Text("进行中").tag("active"); Text("已完成").tag("complete"); Text("需处理").tag("attention") }.pickerStyle(.segmented).labelsHidden().frame(width: 340)
-                Spacer(); Button("挂载全部") { model.send("mount", visible: true) { _ in model.refresh() } }
+                Spacer()
+                Button("清理已结束任务…", systemImage: "trash") { showTaskCleanup = true }
+                    .disabled(model.clearingTasks || !model.tasks.contains { !$0.active })
+                Button("挂载全部") { model.send("mount", visible: true) { _ in model.refresh() } }
             }.padding(.horizontal, 18)
             HSplitView {
                 List(selection: $model.selectedTask) {
@@ -265,6 +294,7 @@ struct BridgeView: View {
                                 Text(task.stateName).font(.caption2).foregroundStyle(.secondary)
                             }
                         }.padding(.vertical, 5).tag(task.id)
+                            .contextMenu { if !task.active { Button("清理此任务记录", role: .destructive) { model.clearTasks(task.id) }.disabled(model.clearingTasks) } }
                     }
                 }.frame(minWidth: 240, idealWidth: 280, maxWidth: 350)
                 ScrollView { TaskDetailView(model: model).padding(24).frame(maxWidth: .infinity, alignment: .leading) }
@@ -294,11 +324,17 @@ struct TaskDetailView: View {
                     LabeledContent("速度", value: formattedBytes(row["rate"]) + "/秒")
                     if row.d("rate") > 0 && active { Text("预计剩余 \(Int(max(0, (row.d("total") - row.d("done")) / row.d("rate")))) 秒").font(.caption).foregroundStyle(.secondary) }
                 }
-                if row.n("path_total") > 1 { Text("数据目录 \(row.n("path_index")) / \(row.n("path_total"))").font(.caption).foregroundStyle(.secondary) }
+                if row.n("path_total") > 1 { Text((row.s("action") == "scan_sizes" ? "应用 " : "数据目录 ") + "\(row.n("path_index")) / \(row.n("path_total"))").font(.caption).foregroundStyle(.secondary) }
                 if !row.s("note").isEmpty { Text(row.s("note")).foregroundStyle(.secondary).textSelection(.enabled) }
                 if !row.s("message").isEmpty { Text(row.s("message")).foregroundStyle(.orange).textSelection(.enabled) }
                 let results = row.o("results")
-                ForEach(results.keys.sorted(), id: \.self) { key in let item = results.o(key); Label(item.s("name", key) + " · " + item.s("message"), systemImage: item.b("ok") ? "checkmark.circle" : "clock").font(.callout) }
+                ForEach(results.keys.sorted(), id: \.self) { key in
+                    let item = results.o(key)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label(item.s("name", key) + " · " + item.s("message"), systemImage: item.b("ok") ? "checkmark.circle" : "clock").font(.callout)
+                        if !item.s("launch_note").isEmpty { Text(item.s("launch_note")).font(.caption).foregroundStyle(.secondary) }
+                    }
+                }
                 HStack {
                     if active { Button("安全停止") { model.send("cancel", ["task_id": row.s("id")]) } }
                     else if ["failed", "stopped", "interrupted"].contains(phase) && !row.s("action").hasPrefix("delete_") {
@@ -393,14 +429,14 @@ struct OriginalCleanupSheet: View {
     let app: BridgeApp
     @Environment(\.dismiss) var dismiss
     @State private var phrase = ""
-    var expected: String { "删除 " + app.name + " 备份" }
+    var expected: String { deletionConfirmation }
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("清理 \(app.name) 原件备份").font(.title2.weight(.semibold))
             Text("清理前会核对备份内容与身份。请先完全退出应用；当前工作数据继续保留。删除后不能从盘桥撤销。")
             ForEach(app.paths.filter { $0.b("original_retained") }.indices, id: \.self) { index in Text(app.paths.filter { $0.b("original_retained") }[index].s("original")).font(.caption).textSelection(.enabled) }
             Text("请输入：" + expected); TextField("确认短语", text: $phrase)
-            HStack { Spacer(); Button("取消") { dismiss() }; Button("永久清理备份", role: .destructive) { dismiss(); model.perform(app.value.b("archived") ? "delete_archived_original" : "delete_original", app: app, values: ["phrase": phrase]) }.disabled(phrase != expected) }
+            HStack { Spacer(); Button("取消") { dismiss() }; Button("确认删除", role: .destructive) { dismiss(); model.perform(app.value.b("archived") ? "delete_archived_original" : "delete_original", app: app, values: ["phrase": phrase]) }.disabled(phrase != expected) }
         }.padding(26).frame(width: 570)
     }
 }
@@ -409,7 +445,7 @@ struct RetainedCleanupSheet: View {
     let copy: Object
     @Environment(\.dismiss) var dismiss
     @State private var phrase = ""
-    var expected: String { "删除 " + copy.s("name") + " 外置副本" }
+    var expected: String { deletionConfirmation }
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("清理还原后保留的副本").font(.title2.weight(.semibold))
@@ -417,7 +453,7 @@ struct RetainedCleanupSheet: View {
             Text(copy.s("folder")).font(.caption).textSelection(.enabled)
             Text("会先只读核对镜像身份，正在使用的工作卷不能清理。此操作永久删除该外置副本，不影响已还原的工作数据。")
             Text("请输入：" + expected); TextField("确认短语", text: $phrase)
-            HStack { Spacer(); Button("取消") { dismiss() }; Button("永久清理副本", role: .destructive) { dismiss(); model.send("delete_retained", ["copy_id": copy.s("id"), "archived": copy.b("archived"), "phrase": phrase], visible: true) { _ in model.refresh() } }.disabled(phrase != expected) }
+            HStack { Spacer(); Button("取消") { dismiss() }; Button("确认删除", role: .destructive) { dismiss(); model.send("delete_retained", ["copy_id": copy.s("id"), "archived": copy.b("archived"), "phrase": phrase], visible: true) { _ in model.refresh() } }.disabled(phrase != expected) }
         }.padding(26).frame(width: 550)
     }
 }

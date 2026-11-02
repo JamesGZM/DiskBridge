@@ -166,7 +166,7 @@ struct NativeTests {
             try expectFailure { try engine.removeGuard(guardPath, inode: inode + 1) }; try engine.removeGuard(guardPath, inode: inode)
         }
         let service = try NativeService(root: root, runtime: base.appendingPathComponent("runtime"), system: system)
-        service.cachedApplications = [metadata]; service.catalogDate = Date()
+        service.cachedApplications = [metadata]; service.catalogDate = Date(); service.catalogRoots = applicationRootStamps()
         try test("restore requires explicit confirmation") { try expectFailure { _ = try service.execute("rollback", values: ["app_id": "fixture"], task: NativeTask("rollback")) } }
         try test("original cleanup requires exact phrase") { try expectFailure { _ = try service.execute("delete_original", values: ["app_id": "fixture", "phrase": "wrong"], task: NativeTask("delete")) } }
         try test("unknown commands cannot execute code") { try expectFailure { _ = try service.execute("shell", values: ["command": "echo anything"], task: NativeTask("test")) } }
@@ -185,7 +185,7 @@ struct NativeTests {
             let result = try service.execute("prepare_launch", values: ["app_id": "fixture"], task: NativeTask("launch")) as? Object
             try expect(result?.o("fixture").b("ok") == false); try expect(system.opens == 0)
         }
-        try test("external copy cleanup cannot delete active data") { try expectFailure { _ = try service.deleteRetained(["copy_id": "fixture", "phrase": "删除 Fixture 外置副本"], task: NativeTask("delete")) } }
+        try test("external copy cleanup cannot delete active data") { try expectFailure { _ = try service.deleteRetained(["copy_id": "fixture", "phrase": deletionConfirmation], task: NativeTask("delete")) } }
         let infoSystem = InfoSystem(); infoSystem.info = ["VolumeUUID": "EXPECTED", "MountPoint": "/", "Internal": false, "WritableVolume": true]
         try test("startup filesystem is not an external destination") { try expectFailure { _ = try infoSystem.volume("EXPECTED") } }
         try test("same-named disk with wrong UUID is refused") { try expectFailure { _ = try infoSystem.volume("OTHER") } }
@@ -236,7 +236,7 @@ struct NativeTests {
             try expectFailure { _ = try service.execute("delete_archived_original", values: ["app_id": archiveID, "phrase": "wrong"], task: NativeTask("fixture")) }; try expect(exists(original))
         }
         try test("verified archived cleanup preserves current working data") {
-            _ = try service.execute("delete_archived_original", values: ["app_id": archiveID, "phrase": "删除 Fixture 备份"], task: NativeTask("fixture"))
+            _ = try service.execute("delete_archived_original", values: ["app_id": archiveID, "phrase": deletionConfirmation], task: NativeTask("fixture"))
             try expect(!exists(original) && exists(source.appendingPathComponent("message.txt").path)); try expect(service.archivedBackups(NativeStore(root)).isEmpty)
         }
         try test("missing authorization proactively requests guidance once per launch") {
@@ -246,7 +246,7 @@ struct NativeTests {
             model.authorization(false); try expect(!model.needsAuthorization)
         }
         try test("offline configured disks remain listed in storage management") {
-            model.apps = [BridgeApp(value: ["id": "fixture", "paths": [["volume_uuid": "OFFLINE", "folder": "Cache/Fixture"]]])]
+            model.apps = [BridgeApp(value: ["id": "fixture", "migration_state": "migrated", "paths": [["volume_uuid": "OFFLINE", "folder": "Cache/Fixture"]]])]
             model.disks = []; try expect(model.knownDisks.contains { $0.s("uuid") == "OFFLINE" })
         }
         try test("partial manual mounting is persisted as failure") {
@@ -332,7 +332,7 @@ struct NativeTests {
         try Data("挂载后新增消息".utf8).write(to: sourceB.appendingPathComponent("new-message.txt"))
         _ = try call("rollback", ["app_id": app.s("id"), "confirmed": true])
         try test("native restore preserves newly written data") { try expect(!mounted(sourceA.path) && !mounted(sourceB.path)); try expect(String(data: Data(contentsOf: sourceB.appendingPathComponent("new-message.txt")), encoding: .utf8) == "挂载后新增消息") }
-        _ = try call("delete_original", ["app_id": app.s("id"), "phrase": "删除 Native Fixture 备份"])
+        _ = try call("delete_original", ["app_id": app.s("id"), "phrase": deletionConfirmation])
         try test("independent original cleanup leaves working data") { try expect(exists(sourceA.appendingPathComponent("database.bin").path)); try expect(exists(sourceB.appendingPathComponent("new-message.txt").path)) }
         let second = try call("plan", values)
         try test("restored applications can migrate again without overwriting retained images") { try expect(second.b("retained_copy_preserved")); try expect(second.s("destination") != plan.s("destination")) }
@@ -340,7 +340,7 @@ struct NativeTests {
         _ = try call("rollback", ["app_id": app.s("id"), "confirmed": true])
         let copies = try service.retainedCopies(NativeStore(root))
         try test("old rounds remain visible as retained copies") { try expect(copies.count == 4 && copies.contains { $0.b("archived") }) }
-        for copy in copies { _ = try call("delete_retained", ["copy_id": copy.s("id"), "archived": copy.b("archived"), "phrase": "删除 Native Fixture 外置副本"]) }
+        for copy in copies { _ = try call("delete_retained", ["copy_id": copy.s("id"), "archived": copy.b("archived"), "phrase": deletionConfirmation]) }
         try test("read-only identity checks protect retained image cleanup") { try expect(service.retainedCopies(NativeStore(root)).isEmpty); try expect(exists(sourceB.appendingPathComponent("new-message.txt").path)) }
     }
 }
