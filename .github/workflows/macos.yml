@@ -2,6 +2,7 @@ name: macOS
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -9,11 +10,13 @@ permissions:
 
 jobs:
   native:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Require Apple Silicon
+        run: test "$(uname -m)" = arm64
       - name: Check public source contents
         run: swift Tools/PrivacyCheck.swift
       - name: Run native tests

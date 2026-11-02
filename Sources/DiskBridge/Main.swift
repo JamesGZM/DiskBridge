@@ -161,7 +161,10 @@ final class BridgeDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openApp(_ sender: NSMenuItem) { if let id = sender.representedObject as? String, let app = model.apps.first(where: { $0.id == id }) { model.openApp(app) } }
     @objc func mountAll() { model.send("mount", visible: true) { _ in self.model.refresh() } }
     @objc func showTasks() { model.page = "tasks"; showManager() }
-    @objc func about() { NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "盘桥", .applicationVersion: "2.0", .credits: NSAttributedString(string: "应用数据外置管理 · Swift 原生实现")]) }
+    @objc func about() {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Development"
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "盘桥", .applicationVersion: version, .credits: NSAttributedString(string: "应用数据外置管理 · Swift 原生实现")])
+    }
     @objc func quit() { NSApp.terminate(nil) }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showManager(); return true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

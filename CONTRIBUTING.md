@@ -17,3 +17,5 @@ swift Tools/PrivacyCheck.swift
 公开问题与 Pull Request 请遵循 [隐私说明](docs/PRIVACY.md)。不要附带密钥、签名证书或聊天文件。
 
 代码贡献采用本项目的 MIT 协议。
+
+发布版本需要更新 `VERSION` 和 `docs/RELEASE_NOTES.md`，然后推送对应的 `v版本号` 标签。发布工作流只生成 ARM64、无开发者身份签名且未公证的安装包；不要上传自己的签名证书或本机数据。可先在 Actions 手动打包检查 artifact。

@@ -4,7 +4,15 @@
 
 盘桥是一款 **仅面向 macOS 的原生应用**，使用 Swift、SwiftUI 和 AppKit 实现管理窗口、菜单栏及后台任务。通过 APFS 稀疏镜像将外置数据挂载到应用原来的数据目录，应用本体仍留在本机。
 
-**MIT 开源 · macOS 14+ · 无 Python 后台 · 无第三方运行时依赖**
+**MIT 开源 · Apple Silicon / macOS 14+ · 无 Python 后台 · 无第三方运行时依赖**
+
+## 下载
+
+在 [GitHub Releases](https://github.com/JamesGZM/DiskBridge/releases/latest) 下载 ARM64 DMG 和对应的 SHA-256 校验文件。当前仅支持 M 系列芯片，不提供 Intel 安装包。
+
+公开 DMG 不使用证书签名，也不做 Apple 公证；应用保留 M 芯片运行所需的无身份 ad-hoc 签名。macOS 可能提示无法验证开发者，请先确认下载来源和校验和，再按系统的应用打开提示自行操作。应用不使用个人证书，也不附带任何用户数据。
+
+[Apple 关于 Apple Silicon 可执行文件签名的说明](https://developer.apple.com/documentation/macos-release-notes/macos-big-sur-11_0_1-universal-apps-release-notes)。
 
 ## 功能
 
@@ -37,7 +45,7 @@ swift test
 DISKBRIDGE_SIGN_IDENTITY='YOUR_SIGNING_IDENTITY' ./scripts/build-app.sh
 ```
 
-此变量只选择钥匙串中已有的证书；项目不会生成、保存或导出签名私钥。构建使用当前 Mac 的架构；Apple Silicon 已验证，Intel 尚未实机验证。
+此变量只选择钥匙串中已有的证书；项目不会生成、保存或导出签名私钥。目前构建脚本只接受原生 ARM64 环境，并检查生成的可执行文件架构。
 
 ### 打包 DMG
 
@@ -47,7 +55,24 @@ DISKBRIDGE_SIGN_IDENTITY='YOUR_SIGNING_IDENTITY' ./scripts/build-app.sh
 
 安装镜像和 SHA-256 文件会生成到 `dist/`。镜像提供将应用拖入 Applications 的入口。
 
-如需给 DMG 签名，使用相同的 `DISKBRIDGE_SIGN_IDENTITY`。脚本不会自动提交 Apple 公证，也不会自动上传产物。本仓库只发布源码，不附带个人证书签名的安装包。
+如需给自己的 DMG 签名，使用相同的 `DISKBRIDGE_SIGN_IDENTITY`。脚本不会自动提交 Apple 公证。公开发布工作流固定使用无身份签名，不读取个人证书。
+
+### Actions 自动打包与发布
+
+[Apple Silicon DMG 工作流](.github/workflows/release.yml) 在 GitHub 的 ARM64 macOS runner 上执行隐私检查、测试、构建、打包和镜像核验。
+
+- 在 Actions 中手动运行：生成可下载的 `DiskBridge-macos-arm64` artifact，不发布版本。
+- 修改 `VERSION` 和 `docs/RELEASE_NOTES.md` 后推送对应的 `v版本号` 标签：通过全部检查后自动发布 GitHub Release。
+- 产物只有未签名 DMG 和 SHA-256 文件；不上传证书、配置、日志或运行数据。
+
+例如发布新版本时：
+
+```sh
+git tag v2.0.1
+git push origin v2.0.1
+```
+
+标签必须与 `VERSION` 一致。核验脚本会检查 ARM64、版本号、应用的 ad-hoc 签名、DMG 未签名状态、校验和和镜像实际内容，再允许上传。
 
 ## 使用流程
 

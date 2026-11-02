@@ -1,0 +1,91 @@
+name: Apple Silicon DMG
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DISKBRIDGE_SIGN_IDENTITY: '-'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check architecture and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
+          fi
+      - name: Check public source contents
+        run: swift Tools/PrivacyCheck.swift
+      - name: Run native tests
+        run: swift test
+      - name: Build identity-free arm64 app
+        run: ./scripts/build-app.sh
+      - name: Package unsigned DMG
+        run: ./scripts/package-dmg.sh
+      - name: Verify release contents and signatures
+        run: ./scripts/verify-release.sh
+      - name: Upload DMG and SHA-256
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: DiskBridge-macos-arm64
+          path: |
+            dist/DiskBridge-*-macos-arm64.dmg
+            dist/DiskBridge-*-macos-arm64.dmg.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+          overwrite: true
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: DiskBridge-macos-arm64
+          path: dist
+      - name: Verify downloaded assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cat VERSION)"
+          test "$GITHUB_REF_NAME" = "v$version"
+          test -f "dist/DiskBridge-$version-macos-arm64.dmg"
+          cd dist
+          sha256sum --check "DiskBridge-$version-macos-arm64.dmg.sha256"
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(cat VERSION)"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/DiskBridge-$version-macos-arm64.dmg" \
+            "dist/DiskBridge-$version-macos-arm64.dmg.sha256" \
+            --verify-tag --latest \
+            --title "盘桥 $version · Apple Silicon" \
+            --notes-file docs/RELEASE_NOTES.md
