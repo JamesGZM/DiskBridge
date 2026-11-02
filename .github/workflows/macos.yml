@@ -1,0 +1,24 @@
+name: macOS
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check public source contents
+        run: swift Tools/PrivacyCheck.swift
+      - name: Run native tests
+        run: swift test
+      - name: Build macOS app
+        run: ./scripts/build-app.sh
+      - name: Verify local app signature
+        run: codesign --verify --deep --strict dist/盘桥.app
